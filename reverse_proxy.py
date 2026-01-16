@@ -141,55 +141,70 @@ def handle_connection(connection: socket.socket, addr) -> None:
 
 
                     # everything below this is cooked ....
-                    server_buffer = bytearray()
-
-                    while header_delimiter not in server_buffer:
-                        chunk = s2.recv(1024)
-                        # wtf is this figure it out
-                        # if not chunk:
-                        #     if not buffer:
-                        #         if VERBOSE: print('Connection closed cleanly by client')
-                        #         return
-                        #     else:
-                        #         if VERBOSE: print('Connection closed before client sent full header')
-                        #         return
-                        server_buffer.extend(chunk)
-
-                    response_head_raw, _, response_remaining_bytes = server_buffer.partition(header_delimiter) # partition returns (before, delimiter, after)
-                    
-                    response_headers_raw = response_head_raw.decode('utf-8').split('\r\n')[1:]
+                    response_message = s2.recv(4096)
+                    head, _, body = response_message.partition(header_delimiter)
 
                     try:
-                        response_headers = get_headers(response_headers_raw)
+                        response_headers = get_headers(head.decode('utf-8').split('\r\n')[1:])
                     except ValueError:
                         if VERBOSE: print('Failed to parse headers from server response')
                         # send back bad request 400
                         return
-
-                    #print(response_headers)
-
-                    try:
-                        response_content_length = int(response_headers.get('content-length', 0)) # important, read this from the headers
-                    except ValueError:
-                        if VERBOSE: print('Failed to fetch content length from server response')
-                        # send back bad request
-
-                    response_body = bytearray(response_remaining_bytes)
-
-                    while len(response_body) < response_content_length:
-                        bytes_to_read = response_content_length - len(body)
-                        chunk = s.recv(min(bytes_to_read, 4096))
-                        if not chunk:
-                            if VERBOSE: print('Failed reading request body')
-                            # send back internal server error
-                            return
-                        response_body.extend(chunk)
                     
-                response_body = response_body[:response_content_length]
+                    print(response_headers)
+                    print(body)
+                    
 
-                response_message = response_head_raw + header_delimiter + response_body if response_body else response_head_raw + b'\r\n'
+
+                #     server_buffer = bytearray()
+
+                #     while header_delimiter not in server_buffer:
+                #         chunk = s2.recv(1024)
+                #         # wtf is this figure it out
+                #         # if not chunk:
+                #         #     if not buffer:
+                #         #         if VERBOSE: print('Connection closed cleanly by client')
+                #         #         return
+                #         #     else:
+                #         #         if VERBOSE: print('Connection closed before client sent full header')
+                #         #         return
+                #         server_buffer.extend(chunk)
+
+                #     response_head_raw, _, response_remaining_bytes = server_buffer.partition(header_delimiter) # partition returns (before, delimiter, after)
+                    
+                #     response_headers_raw = response_head_raw.decode('utf-8').split('\r\n')[1:]
+
+                #     try:
+                #         response_headers = get_headers(response_headers_raw)
+                #     except ValueError:
+                #         if VERBOSE: print('Failed to parse headers from server response')
+                #         # send back bad request 400
+                #         return
+
+                #     #print(response_headers)
+
+                #     try:
+                #         response_content_length = int(response_headers.get('content-length', 0)) # important, read this from the headers
+                #     except ValueError:
+                #         if VERBOSE: print('Failed to fetch content length from server response')
+                #         # send back bad request
+
+                #     response_body = bytearray(response_remaining_bytes)
+
+                #     while len(response_body) < response_content_length:
+                #         bytes_to_read = response_content_length - len(body)
+                #         chunk = s.recv(min(bytes_to_read, 4096))
+                #         if not chunk:
+                #             if VERBOSE: print('Failed reading request body')
+                #             # send back internal server error
+                #             return
+                #         response_body.extend(chunk)
+                    
+                # response_body = response_body[:response_content_length]
+
+                # response_message = response_head_raw + header_delimiter + response_body if response_body else response_head_raw + b'\r\n'
                 
-                
+
 
 
             # catch exceptions too
