@@ -6,11 +6,14 @@ import argparse
 import threading
 
 from utilities import get_request_line, get_headers
+from handlers import ip_hash, least_connections, random, round_robin
 
 parser = argparse.ArgumentParser(description="Configs for simple HTTP server")
 parser.add_argument('--port', type=int, default=8443, help='Port for server to run on')
 parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Enable verbose mode for workers')
 parser.add_argument('-d', '--discover', action='store_true', default=False, help='Enable background thread to discover servers')
+parser.add_argument('-l', '--load', type=str, default='LEAST_CONNECTIONS', help='Choose a method of load balancing')
+
 args = parser.parse_args()
 
 HOST = '' # difference between windows and linux
@@ -21,8 +24,12 @@ VERBOSE = args.verbose
 
 RUNNING = True
 
-cached_requests = {} # important! figure out how to do this, store as (Method, Path)
-servers = [] # important! figure out how to get a list of servers, store as (IP, PORT)
+DISPATCH_DICTIONARY = {'IP_HASH': ip_hash, 'LEAST_CONNECTIONS': least_connections, 'RANDOM': random, 'ROUND_ROBIN': round_robin}
+
+LOAD_BALANCING_ALGORITHM = args.load.upper() if args.load.upper() in DISPATCH_DICTIONARY else 'LEAST_CONNECTIONS'
+
+cached_requests = {} # important! figure out how to do this, store as (Method, Path): (message, timeout)
+servers = {} # store dict as (IP, Port): # connections
 
 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
 context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
@@ -73,15 +80,25 @@ def handle_connection(connection: socket.socket, addr) -> None:
                 return
 
             if (method, path) in cached_requests:
-                s.sendall(cached_requests[(method, path)]) # FIGURE THIS OUT !!!
+                # validate time !!!
+                s.sendall(cached_requests[(method, path)][0]) # FIGURE THIS OUT !!!
 
             headers['X-Forwarded-For'] = f'{addr[0].replace("'", '')}'
             headers['X-Forwarded-Proto'] = 'https'
 
-            print(addr)
+            targeted_ip, targeted_port = DISPATCH_DICTIONARY[LOAD_BALANCING_ALGORITHM](servers, addr[:2]) # remember addr is a tuple (host, port, flow info, scope id)
 
-    except Exception as e:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((targeted_ip, targeted_port))
+                s.sendall(b'') # IMPORTANT!!! SEE WHAT THIS SHOULD BE
+
+                server_response = ... # THEN WAIT FOR SERVER RESPONSE
+                
+
+    except OSError as e:
         print(f'SSL error: {e}')
+    except Exception as e:
+        ... # some other error happened !!!
     print('thread closed')
 
 def discover_servers() -> None:
@@ -93,7 +110,7 @@ def discover_servers() -> None:
         while True:
             _, addr = discovery_sock.accept() # make sure that i don't need to socket itself, just the information
             # addr is in the form ('IP', PORT, _, _)
-            servers.append((addr[0], addr[1]))
+            servers[(addr[0], addr[1])] = 0
             print(f'found server {addr}')
 
 def main() -> None:
