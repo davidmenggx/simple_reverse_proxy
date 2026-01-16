@@ -1,2 +1,2 @@
-def least_connections(servers: dict, client_addr: tuple[str, int]) -> tuple[str, int]:
-    ...
+def least_connections(servers: dict, _client_ip: str, _round_robin_counter: int) -> tuple[str, int]:
+    return min(servers, key=servers.get) # type: ignore

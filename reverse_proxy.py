@@ -28,8 +28,11 @@ DISPATCH_DICTIONARY = {'IP_HASH': ip_hash, 'LEAST_CONNECTIONS': least_connection
 
 LOAD_BALANCING_ALGORITHM = args.load.upper() if args.load.upper() in DISPATCH_DICTIONARY else 'LEAST_CONNECTIONS'
 
+ROUND_ROBIN_COUNTER = 0
+
 cached_requests = {} # important! figure out how to do this, store as (Method, Path): (message, timeout)
 servers = {} # store dict as (IP, Port): # connections
+server_lock = threading.Lock()
 
 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
 context.load_cert_chain(certfile='cert.pem', keyfile='key.pem')
@@ -86,15 +89,32 @@ def handle_connection(connection: socket.socket, addr) -> None:
             headers['X-Forwarded-For'] = f'{addr[0].replace("'", '')}'
             headers['X-Forwarded-Proto'] = 'https'
 
-            targeted_ip, targeted_port = DISPATCH_DICTIONARY[LOAD_BALANCING_ALGORITHM](servers, addr[:2]) # remember addr is a tuple (host, port, flow info, scope id)
-
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((targeted_ip, targeted_port))
-                s.sendall(b'') # IMPORTANT!!! SEE WHAT THIS SHOULD BE
-
-                server_response = ... # THEN WAIT FOR SERVER RESPONSE
+            with server_lock:
+                if LOAD_BALANCING_ALGORITHM == 'ROUND_ROBIN':
+                    global ROUND_ROBIN_COUNTER
+                    ROUND_ROBIN_COUNTER += 1
                 
+                targeted_ip, targeted_port = DISPATCH_DICTIONARY[LOAD_BALANCING_ALGORITHM](servers, addr[0], ROUND_ROBIN_COUNTER) # remember addr is a tuple (host, port, flow info, scope id)
+                servers[(targeted_ip, targeted_port)] += 1
+            
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    try:
+                        s.connect((targeted_ip, targeted_port))
+                    except ConnectionRefusedError:
+                        print(f'CRITICAL: Could not connect to server ({targeted_ip}, {targeted_port}), removing from servers list')
+                        with server_lock:
+                            servers.pop((targeted_ip, targeted_port))
 
+                    s.sendall(b'') # IMPORTANT!!! SEE WHAT THIS SHOULD BE
+
+                    server_response = ... # THEN WAIT FOR SERVER RESPONSE
+            finally:
+                with server_lock:
+                    servers[(targeted_ip, targeted_port)] -= 1
+                    if servers[(targeted_ip, targeted_port)] < 0: # the # of connections can never be negative
+                        print('CRITICAL: # connetions fell below 0. Forcefully resetting back to 0')
+                        servers[(targeted_ip, targeted_port)] = 0
     except OSError as e:
         print(f'SSL error: {e}')
     except Exception as e:
@@ -110,8 +130,9 @@ def discover_servers() -> None:
         while True:
             _, addr = discovery_sock.accept() # make sure that i don't need to socket itself, just the information
             # addr is in the form ('IP', PORT, _, _)
-            servers[(addr[0], addr[1])] = 0
-            print(f'found server {addr}')
+            with server_lock:
+                servers[(addr[0], addr[1])] = 0
+                print(f'found server {addr}')
 
 def main() -> None:
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server_sock:
