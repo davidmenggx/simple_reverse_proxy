@@ -107,7 +107,7 @@ def handle_connection(connection: socket.socket, addr) -> None:
                 body.extend(chunk)
             
             body = body[:content_length]
-
+            
             new_request = (f'{method} {path} {protocol_version}\r\n').encode('utf-8')
             for header in headers:
                 new_request += (f'{header}: {headers[header]}\r\n').encode('utf-8')
@@ -120,6 +120,7 @@ def handle_connection(connection: socket.socket, addr) -> None:
                 
                 targeted_ip, targeted_port = DISPATCH_DICTIONARY[LOAD_BALANCING_ALGORITHM](servers, addr[0], ROUND_ROBIN_COUNTER) # remember addr is a tuple (host, port, flow info, scope id)
                 servers[(targeted_ip, targeted_port)] += 1
+                connection_success = False
 
             print(f'chose server ({targeted_ip}, {targeted_port})')
             
@@ -127,6 +128,7 @@ def handle_connection(connection: socket.socket, addr) -> None:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
                     try:
                         s2.connect((targeted_ip, targeted_port))
+                        connection_success = True
                         print(f'connected to chosen server ({targeted_ip}, {targeted_port})')
                     except ConnectionRefusedError:
                         print(f'CRITICAL: Could not connect to server ({targeted_ip}, {targeted_port}), removing from servers list')
@@ -139,8 +141,6 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     s2.sendall(new_request)
                     print('found response')
 
-
-                    # everything below this is cooked ....
                     server_buffer = bytearray()
 
                     while header_delimiter not in server_buffer:
@@ -164,9 +164,7 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     except ValueError:
                         if VERBOSE: print('Failed to parse headers from server response')
                         # send back bad request 400
-                        return
-
-                    #print(response_headers)
+                        return # maybe don't return because this skips stuff
 
                     try:
                         response_content_length = int(response_headers.get('content-length', 0)) # important, read this from the headers
@@ -177,28 +175,36 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     response_body = bytearray(response_remaining_bytes)
 
                     while len(response_body) < response_content_length:
-                        bytes_to_read = response_content_length - len(body)
-                        chunk = s.recv(min(bytes_to_read, 4096))
+                        bytes_to_read = response_content_length - len(response_body)
+                        chunk = s2.recv(min(bytes_to_read, 4096))
                         if not chunk:
                             if VERBOSE: print('Failed reading request body')
                             # send back internal server error
-                            return
+                            return # maybe don't return because this skips stuff
                         response_body.extend(chunk)
                     
                 response_body = response_body[:response_content_length]
 
-                response_message = response_head_raw + header_delimiter + response_body if response_body else response_head_raw + b'\r\n'
+                response_message = f"{response_head_raw.decode('utf-8').split('\r\n')[0]}\r\n".encode('utf-8')
+                for header in response_headers:
+                    response_message += (f'{header}: {headers[header]}\r\n').encode('utf-8')
+                response_message += b'\r\n' + response_body
+
+                print(response_message.decode('utf-8'))
+
+                # response_message = response_head_raw + header_delimiter + response_body if response_body else response_head_raw + b'\r\n'
                 
-                
+                # print(response_message)
 
 
             # catch exceptions too
             finally:
-                with server_lock:
-                    servers[(targeted_ip, targeted_port)] -= 1
-                    if servers[(targeted_ip, targeted_port)] < 0: # the # of connections can never be negative
-                        print('CRITICAL: # connetions fell below 0. Forcefully resetting back to 0')
-                        servers[(targeted_ip, targeted_port)] = 0
+                if connection_success:
+                    with server_lock:
+                        servers[(targeted_ip, targeted_port)] -= 1
+                        if servers[(targeted_ip, targeted_port)] < 0: # the # of connections can never be negative
+                            print('CRITICAL: # connetions fell below 0. Forcefully resetting back to 0')
+                            servers[(targeted_ip, targeted_port)] = 0
 
 
     except OSError as e:
