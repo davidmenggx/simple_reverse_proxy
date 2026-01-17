@@ -1,15 +1,16 @@
 import ssl
 import gzip
+import time
 import signal
 import socket
 import argparse
 import threading
 
-from utilities import get_request_line, get_headers
 from handlers import ip_hash, least_connections, random, round_robin
+from utilities import get_request_line, get_headers, get_cache_control
 
 parser = argparse.ArgumentParser(description="Configs for simple HTTP server")
-parser.add_argument('--port', type=int, default=8443, help='Port for server to run on')
+parser.add_argument('-p', '--port', type=int, default=8443, help='Port for server to run on')
 parser.add_argument('-v', '--verbose', action='store_true', default=False, help='Enable verbose mode for workers')
 parser.add_argument('-d', '--discover', action='store_true', default=False, help='Enable background thread to discover servers')
 parser.add_argument('-l', '--load', type=str, default='LEAST_CONNECTIONS', help='Choose a method of load balancing')
@@ -32,7 +33,11 @@ ROUND_ROBIN_COUNTER = 0
 
 HEADER_DELIMITER = b'\r\n\r\n'
 
+SERVER_TIMEOUT = 10 # seconds
+
 cached_requests = {} # important! figure out how to do this, store as (Method, Path): (message, timeout)
+cache_lock = threading.Lock()
+
 servers = {} # store dict as (IP, Port): # connections
 server_lock = threading.Lock()
 
@@ -87,7 +92,12 @@ def handle_connection(connection: socket.socket, addr) -> None:
 
             if (method, path) in cached_requests:
                 # validate time !!!
-                s.sendall(cached_requests[(method, path)][0]) # FIGURE THIS OUT !!!
+                if time.time() < cached_requests[(method, path)][1]:
+                    print('cache hit')
+                    s.sendall(cached_requests[(method, path)][0]) # FIGURE THIS OUT !!!
+                    return
+                else:
+                    cached_requests.pop((method, path))
 
             request_headers['X-Forwarded-For'] = f'{addr[0].replace("'", '')}'
             request_headers['X-Forwarded-Proto'] = 'https'
@@ -117,6 +127,10 @@ def handle_connection(connection: socket.socket, addr) -> None:
                 new_request += (f'{header}: {request_headers[header]}\r\n').encode('utf-8')
             new_request += b'\r\n' + request_body
 
+            if not servers:
+                # send back error here
+                return
+
             with server_lock:
                 if LOAD_BALANCING_ALGORITHM == 'ROUND_ROBIN':
                     global ROUND_ROBIN_COUNTER
@@ -130,6 +144,7 @@ def handle_connection(connection: socket.socket, addr) -> None:
             
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                    s2.settimeout(SERVER_TIMEOUT) # seconds
                     try:
                         s2.connect((targeted_ip, targeted_port))
                         connection_success = True
@@ -191,22 +206,27 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     
                 response_body = response_body[:response_content_length]
 
-                # now check to compress message !!!
-                # remember to update the content-length header before rebuilding
+                if 'accept-encoding' in lower_request_headers and 'content-encoding' not in lower_response_headers:
+                    if 'gzip' in lower_request_headers['accept-encoding']:
+                        response_body = gzip.compress(response_body)
+                        response_headers['Content-Length'] = str(len(response_body))
+                        response_headers['Content-Encoding'] = 'gzip'
 
                 response_message = f"{response_head_raw.decode('utf-8').split('\r\n')[0]}\r\n".encode('utf-8')
                 for header in response_headers:
                     response_message += (f'{header}: {response_headers[header]}\r\n').encode('utf-8')
                 response_message += b'\r\n' + response_body
 
-                print(response_message.decode('utf-8'))
+                if 'cache-control' in lower_response_headers:
+                    max_age = get_cache_control(lower_response_headers['cache-control'])
+                    if max_age:
+                        with cache_lock:
+                            cached_requests[(method, path)] = (response_message, time.time() + max_age)
 
-                # response_message = response_head_raw + header_delimiter + response_body if response_body else response_head_raw + b'\r\n'
-                
-                # print(response_message)
-
-
+                s.sendall(response_message)
             # catch exceptions too
+            except TimeoutError:
+                print(f'Selected server did not response in {SERVER_TIMEOUT} seconds')
             finally:
                 if connection_success:
                     with server_lock:
@@ -214,8 +234,6 @@ def handle_connection(connection: socket.socket, addr) -> None:
                         if servers[(targeted_ip, targeted_port)] < 0: # the # of connections can never be negative
                             print('CRITICAL: # connetions fell below 0. Forcefully resetting back to 0')
                             servers[(targeted_ip, targeted_port)] = 0
-
-
     except OSError as e:
         print(f'SSL error: {e}')
     except Exception as e:
@@ -228,15 +246,24 @@ def discover_servers() -> None:
         discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         discovery_sock.listen() 
 
+        buffer = ""
         while True:
             conn, addr = discovery_sock.accept() # make sure that i don't need to socket itself, just the information
             # addr is in the form ('IP', PORT, _, _)
             with conn:
                 data = conn.recv(1024)
-                ip, port = data.decode('utf-8').split(',')
-            with server_lock:
-                servers[(ip, int(port))] = 0
-                print(f'Found server ({ip}, {port})')
+                buffer += data.decode('utf-8')
+
+                while '\r\n' in buffer:
+                    message, buffer = buffer.split('\r\n', 1)
+                    if message:
+                        try:
+                            ip, port = message.split(',')
+                            with server_lock:
+                                servers[(ip, int(port))] = 0
+                                print(f'Found server ({ip}, {port})')
+                        except ValueError:
+                            print(f"Malformed message received: {message}")
 
 def main() -> None:
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server_sock:
