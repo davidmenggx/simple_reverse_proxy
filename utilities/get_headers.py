@@ -12,6 +12,6 @@ def get_headers(headers: list[str]) -> dict[str, str]:
         if len(header) != 2:
             raise ValueError('Parse Error - Headers')
         
-        res[header[0].lower()] = header[1].lower()
+        res[header[0]] = header[1]
     
     return res

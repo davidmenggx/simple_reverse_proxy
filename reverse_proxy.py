@@ -30,6 +30,8 @@ LOAD_BALANCING_ALGORITHM = args.load.upper() if args.load.upper() in DISPATCH_DI
 
 ROUND_ROBIN_COUNTER = 0
 
+HEADER_DELIMITER = b'\r\n\r\n'
+
 cached_requests = {} # important! figure out how to do this, store as (Method, Path): (message, timeout)
 servers = {} # store dict as (IP, Port): # connections
 server_lock = threading.Lock()
@@ -51,67 +53,69 @@ def handle_connection(connection: socket.socket, addr) -> None:
         with context.wrap_socket(connection, server_side=True) as s:
             print('connected')
 
-            buffer = bytearray()
-            header_delimiter = b'\r\n\r\n'
+            request_buffer = bytearray()
 
-            while header_delimiter not in buffer:
+            while HEADER_DELIMITER not in request_buffer:
                 chunk = s.recv(1024)
                 if not chunk:
-                    if not buffer:
+                    if not request_buffer:
                         if VERBOSE: print('Connection closed cleanly by client')
                         return
                     else:
                         if VERBOSE: print('Connection closed before client sent full header')
                         return
-                buffer.extend(chunk)
+                request_buffer.extend(chunk)
             
-            head_raw, _, remaining_bytes = buffer.partition(header_delimiter) # partition returns (before, delimiter, after)
-            head = head_raw.decode('utf-8')
+            request_head_raw, _, request_remaining_bytes = request_buffer.partition(HEADER_DELIMITER) # partition returns (before, delimiter, after)
+            request_head = request_head_raw.decode('utf-8')
 
             try:
-                (method, path, protocol_version), remaining_head = get_request_line(head)
+                (method, path, protocol_version), remaining_head = get_request_line(request_head)
             except ValueError:
                 if VERBOSE: print('Error parsing request line')
                 # send back bad request 400
                 return 
             
             try:
-                headers = get_headers(remaining_head)
+                request_headers = get_headers(remaining_head)
             except ValueError:
                 if VERBOSE: print('Failed to parse headers')
                 # send back bad request 400
                 return
+            
+            lower_request_headers = {k.lower(): v.lower() for k, v in request_headers.items()} # get_headers leaves headers untouched so they can be rebuilt in the response
 
             if (method, path) in cached_requests:
                 # validate time !!!
                 s.sendall(cached_requests[(method, path)][0]) # FIGURE THIS OUT !!!
 
-            headers['X-Forwarded-For'] = f'{addr[0].replace("'", '')}'
-            headers['X-Forwarded-Proto'] = 'https'
+            request_headers['X-Forwarded-For'] = f'{addr[0].replace("'", '')}'
+            request_headers['X-Forwarded-Proto'] = 'https'
 
             try:
-                content_length = int(headers.get('content-length', 0)) # important, read this from the headers
+                request_content_length = int(lower_request_headers.get('content-length', 0)) # important, read this from the headers
             except ValueError:
                 if VERBOSE: print('Failed to fetch content length')
                 # send back bad request
 
-            body = bytearray(remaining_bytes)
+            request_body = bytearray(request_remaining_bytes)
 
-            while len(body) < content_length:
-                bytes_to_read = content_length - len(body)
+            while len(request_body) < request_content_length:
+                bytes_to_read = request_content_length - len(request_body)
                 chunk = s.recv(min(bytes_to_read, 4096))
                 if not chunk:
                     if VERBOSE: print('Failed reading request body')
                     # send back internal server error
                     return
-                body.extend(chunk)
+                request_body.extend(chunk)
             
-            body = body[:content_length]
+            request_body = request_body[:request_content_length]
             
+            # rebuild the request after adding new headers to send to server
             new_request = (f'{method} {path} {protocol_version}\r\n').encode('utf-8')
-            for header in headers:
-                new_request += (f'{header}: {headers[header]}\r\n').encode('utf-8')
-            new_request += b'\r\n' + body
+            for header in request_headers:
+                new_request += (f'{header}: {request_headers[header]}\r\n').encode('utf-8')
+            new_request += b'\r\n' + request_body
 
             with server_lock:
                 if LOAD_BALANCING_ALGORITHM == 'ROUND_ROBIN':
@@ -141,9 +145,9 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     s2.sendall(new_request)
                     print('found response')
 
-                    server_buffer = bytearray()
+                    response_buffer = bytearray()
 
-                    while header_delimiter not in server_buffer:
+                    while HEADER_DELIMITER not in response_buffer:
                         chunk = s2.recv(1024)
                         # wtf is this figure it out
                         # if not chunk:
@@ -153,9 +157,9 @@ def handle_connection(connection: socket.socket, addr) -> None:
                         #     else:
                         #         if VERBOSE: print('Connection closed before client sent full header')
                         #         return
-                        server_buffer.extend(chunk)
+                        response_buffer.extend(chunk)
 
-                    response_head_raw, _, response_remaining_bytes = server_buffer.partition(header_delimiter) # partition returns (before, delimiter, after)
+                    response_head_raw, _, response_remaining_bytes = response_buffer.partition(HEADER_DELIMITER) # partition returns (before, delimiter, after)
                     
                     response_headers_raw = response_head_raw.decode('utf-8').split('\r\n')[1:]
 
@@ -165,9 +169,11 @@ def handle_connection(connection: socket.socket, addr) -> None:
                         if VERBOSE: print('Failed to parse headers from server response')
                         # send back bad request 400
                         return # maybe don't return because this skips stuff
+                    
+                    lower_response_headers = {k.lower(): v.lower() for k, v in response_headers.items()}
 
                     try:
-                        response_content_length = int(response_headers.get('content-length', 0)) # important, read this from the headers
+                        response_content_length = int(lower_response_headers.get('content-length', 0)) # important, read this from the headers
                     except ValueError:
                         if VERBOSE: print('Failed to fetch content length from server response')
                         # send back bad request
@@ -185,9 +191,12 @@ def handle_connection(connection: socket.socket, addr) -> None:
                     
                 response_body = response_body[:response_content_length]
 
+                # now check to compress message !!!
+                # remember to update the content-length header before rebuilding
+
                 response_message = f"{response_head_raw.decode('utf-8').split('\r\n')[0]}\r\n".encode('utf-8')
                 for header in response_headers:
-                    response_message += (f'{header}: {headers[header]}\r\n').encode('utf-8')
+                    response_message += (f'{header}: {response_headers[header]}\r\n').encode('utf-8')
                 response_message += b'\r\n' + response_body
 
                 print(response_message.decode('utf-8'))
